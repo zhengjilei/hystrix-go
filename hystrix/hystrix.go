@@ -52,6 +52,8 @@ var (
 // new calls to it for you to give the dependent service time to repair.
 //
 // Define a fallback function if you want to define some code to execute during outages.
+
+// 异步执行，将 runFunc 和 fallbackFunc 都用无 deadline 的 context 包装，复用下面的 GoC
 func Go(name string, run runFunc, fallback fallbackFunc) chan error {
 	runC := func(ctx context.Context) error {
 		return run()
@@ -70,6 +72,8 @@ func Go(name string, run runFunc, fallback fallbackFunc) chan error {
 // new calls to it for you to give the dependent service time to repair.
 //
 // Define a fallback function if you want to define some code to execute during outages.
+
+// 异步执行，支持带 context 取消的 circuit breaker 执行
 func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC) chan error {
 	cmd := &command{
 		run:      run,
@@ -89,15 +93,15 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 		return cmd.errChan
 	}
 	cmd.circuit = circuit
-	ticketCond := sync.NewCond(cmd)
-	ticketChecked := false
+	ticketCond := sync.NewCond(cmd) // 为 ticket 创建条件变量，使用等待唤醒模式
+	ticketChecked := false          // 当前请求还未检票
 	// When the caller extracts error from returned errChan, it's assumed that
 	// the ticket's been returned to executorPool. Therefore, returnTicket() can
 	// not run after cmd.errorWithFallback().
 	returnTicket := func() {
 		cmd.Lock()
 		// Avoid releasing before a ticket is acquired.
-		for !ticketChecked {
+		for !ticketChecked { // 即便从 wait 中醒来，有可能仍然还没有检过票，所以需要 for 循环检查票是否检过
 			ticketCond.Wait()
 		}
 		cmd.circuit.executorPool.Return(cmd.ticket)
@@ -105,6 +109,8 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 	}
 	// Shared by the following two goroutines. It ensures only the faster
 	// goroutine runs errWithFallback() and reportAllEvent().
+
+	// returnOnce 保证只有一个 goroutine 执行 errWithFallback() and reportAllEvent().
 	returnOnce := &sync.Once{}
 	reportAllEvent := func() {
 		err := cmd.circuit.ReportEvent(cmd.events, cmd.start, cmd.runDuration)
@@ -114,17 +120,21 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 	}
 
 	go func() {
-		defer func() { cmd.finished <- true }()
+		defer func() { cmd.finished <- true }() // 通知另外一个 goroutine 当前请求已经结束（1. 不允许请求访问，直接返回 2. 允许请求访问 a. 请求执行结束 b. 达到请求最大并发量，拿不到票进场）
 
 		// Circuits get opened when recent executions have shown to have a high error rate.
 		// Rejecting new executions allows backends to recover, and the circuit will allow
 		// new traffic when it feels a healthly state has returned.
 		if !cmd.circuit.AllowRequest() {
+			// 不允许请求进入
 			cmd.Lock()
 			// It's safe for another goroutine to go ahead releasing a nil ticket.
+			// 标记票已经 check，是为了让另外一个 负责超时/cancel 的goroutine （如果已经超时/cancel）从 wait 逻辑里醒来之后跳出 for 循环。
+			// 实际上，当前并没有拿到 ticket, cmd.ticket 是 nil, 但是另外一个 goroutine return a nil ticket 不会做任何事
 			ticketChecked = true
 			ticketCond.Signal()
 			cmd.Unlock()
+			// 执行 return nil ticket, 根据  ErrCircuitOpen 执行 fallback 函数，将该请求中所有的统计数据 发出
 			returnOnce.Do(func() {
 				returnTicket()
 				cmd.errorWithFallback(ctx, ErrCircuitOpen)
@@ -132,6 +142,8 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 			})
 			return
 		}
+
+		// 允许请求进入
 
 		// As backends falter, requests take longer but don't always fail.
 		//
@@ -141,13 +153,17 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 		cmd.Lock()
 		select {
 		case cmd.ticket = <-circuit.executorPool.Tickets:
+			// 拿到 ticket，检票
 			ticketChecked = true
 			ticketCond.Signal()
+			// 唤醒可能进入 cond.wait 状态的 负责 超时/cancel 的 goroutine，让其能 退票、执行 errorWithFallback
 			cmd.Unlock()
 		default:
+			// 拿不到票，并发请求数太多
 			ticketChecked = true
 			ticketCond.Signal()
 			cmd.Unlock()
+			// 报并发量限制错误
 			returnOnce.Do(func() {
 				returnTicket()
 				cmd.errorWithFallback(ctx, ErrMaxConcurrency)
@@ -156,8 +172,9 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 			return
 		}
 
+		// 执行真正的调用逻辑
 		runStart := time.Now()
-		runErr := run(ctx)
+		runErr := run(ctx) // 假设正在执行的过程中， timeout 这时另一个 goroutine 执行 return ticket,
 		returnOnce.Do(func() {
 			defer reportAllEvent()
 			cmd.runDuration = time.Since(runStart)
@@ -175,16 +192,16 @@ func GoC(ctx context.Context, name string, run runFuncC, fallback fallbackFuncC)
 		defer timer.Stop()
 
 		select {
-		case <-cmd.finished:
+		case <-cmd.finished: // 另一个 goroutine 结束
 			// returnOnce has been executed in another goroutine
-		case <-ctx.Done():
+		case <-ctx.Done(): // context cancel
 			returnOnce.Do(func() {
 				returnTicket()
 				cmd.errorWithFallback(ctx, ctx.Err())
 				reportAllEvent()
 			})
 			return
-		case <-timer.C:
+		case <-timer.C: // 超时
 			returnOnce.Do(func() {
 				returnTicket()
 				cmd.errorWithFallback(ctx, ErrTimeout)

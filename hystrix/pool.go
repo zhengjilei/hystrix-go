@@ -25,7 +25,6 @@ func (p *executorPool) Return(ticket *struct{}) {
 	if ticket == nil {
 		return
 	}
-
 	p.Metrics.Updates <- poolMetricsUpdate{
 		activeCount: p.ActiveCount(),
 	}
@@ -33,5 +32,5 @@ func (p *executorPool) Return(ticket *struct{}) {
 }
 
 func (p *executorPool) ActiveCount() int {
-	return p.Max - len(p.Tickets)
+	return p.Max - len(p.Tickets) // 活跃的请求数量
 }

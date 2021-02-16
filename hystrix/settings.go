@@ -21,11 +21,11 @@ var (
 )
 
 type Settings struct {
-	Timeout                time.Duration
-	MaxConcurrentRequests  int
-	RequestVolumeThreshold uint64
-	SleepWindow            time.Duration
-	ErrorPercentThreshold  int
+	Timeout                time.Duration // 请求的超时时间
+	MaxConcurrentRequests  int           // 最大并发请求数
+	RequestVolumeThreshold uint64        // 过去 10 s 的请求总数至少达到该阈值后，才能根据错误率判断是否 healthy 从而决定 trip circuit breaker ,否则数据样本太小，无法判断
+	SleepWindow            time.Duration // 从开关 open 或者上一次测试多久之后 才能开始下一次测试
+	ErrorPercentThreshold  int           // 请求错误率达到多大，才会 trip circuit breaker
 }
 
 // CommandConfig is used to tune circuit settings at runtime

@@ -31,6 +31,9 @@ func init() {
 }
 
 // GetCircuit returns the circuit for the given command and whether this call created it.
+
+// 从 circuitBreakers Map 中拿key为name 的 CircuitBreaker 对象，拿不到则创建一个新的，并存在 circuitBreakers 中
+// 返回的 bool 值表示是否是新创建的
 func GetCircuit(name string) (*CircuitBreaker, bool, error) {
 	circuitBreakersMutex.RLock()
 	_, ok := circuitBreakers[name]
@@ -41,6 +44,8 @@ func GetCircuit(name string) (*CircuitBreaker, bool, error) {
 		// because we released the rlock before we obtained the exclusive lock,
 		// we need to double check that some other thread didn't beat us to
 		// creation.
+
+		// 从 RUnlock 到 Lock 之间有间隔，即便得到锁了，但是其他线程有可能在这间隙已经修改了 circuitBreakers，key为name的 breaker 已经存在
 		if cb, ok := circuitBreakers[name]; ok {
 			return cb, false, nil
 		}
@@ -124,6 +129,7 @@ func (circuit *CircuitBreaker) allowSingleTest() bool {
 
 	now := time.Now().UnixNano()
 	openedOrLastTestedTime := atomic.LoadInt64(&circuit.openedOrLastTestedTime)
+	// 如果距离上一次开关打开的时间戳或者上一次测试的时间戳  间隔超过 SleepWindow，则允许本次请求进入，进行测试，但是改变开关状态
 	if circuit.open && now > openedOrLastTestedTime+getSettings(circuit.Name).SleepWindow.Nanoseconds() {
 		swapped := atomic.CompareAndSwapInt64(&circuit.openedOrLastTestedTime, openedOrLastTestedTime, now)
 		if swapped {
@@ -145,7 +151,7 @@ func (circuit *CircuitBreaker) setOpen() {
 
 	log.Printf("hystrix-go: opening circuit %v", circuit.Name)
 
-	circuit.openedOrLastTestedTime = time.Now().UnixNano()
+	circuit.openedOrLastTestedTime = time.Now().UnixNano() // 设置 open 的时间戳或者最近一次的测试时间戳
 	circuit.open = true
 }
 
@@ -172,10 +178,11 @@ func (circuit *CircuitBreaker) ReportEvent(eventTypes []string, start time.Time,
 	circuit.mutex.RLock()
 	o := circuit.open
 	circuit.mutex.RUnlock()
-	if eventTypes[0] == "success" && o {
+	if eventTypes[0] == "success" && o { // 如果当前请求结果是 success, 且 circuit 是 open，则 close circuit
 		circuit.setClose()
 	}
 
+	// 计算当前 pool 的使用率
 	var concurrencyInUse float64
 	if circuit.executorPool.Max > 0 {
 		concurrencyInUse = float64(circuit.executorPool.ActiveCount()) / float64(circuit.executorPool.Max)
